@@ -247,5 +247,213 @@ print("\n--- EMPLOYMENT_TYPE_NAME (counts) ---")
        .show(truncate=False))
 
 ```
+# Replace Company is Staffing with false, and is internship null with false
+```{python}
+# Replace NULLs with False in COMPANY_IS_STAFFING and IS_INTERNSHIP,
+# then show distinct values (and counts)
 
-YOU ARE HERE @ 2:07 IN VIDEO
+from pyspark.sql.functions import col, coalesce, lit, count, desc
+
+# start from df_eda if it exists; otherwise use df
+base = df_eda if 'df_eda' in globals() else df
+
+df_eda = (
+    base
+    .withColumn("COMPANY_IS_STAFFING", coalesce(col("COMPANY_IS_STAFFING"), lit(False)).cast("boolean"))
+    .withColumn("IS_INTERNSHIP",       coalesce(col("IS_INTERNSHIP"),       lit(False)).cast("boolean"))
+)
+
+categorical_cols = ["COMPANY_IS_STAFFING", "IS_INTERNSHIP"]
+
+for colname in categorical_cols:
+    if colname not in df_eda.columns:
+        print(f"⚠️ Skipping {colname} (not found)")
+        continue
+    print(f"\n--- {colname} (distinct) ---")
+    df_eda.select(colname).distinct().show(10, truncate=False)
+
+    print(f"--- {colname} (counts) ---")
+    (df_eda.groupBy(colname)
+           .agg(count("*").alias("count"))
+           .orderBy(desc("count"))
+           .show(truncate=False))
+
+
+```
+
+# Calculate median of the Duration column
+```{python}
+from pyspark.sql.functions import col, coalesce, lit
+
+# use df_eda if it exists; otherwise start from df
+df_eda = df_eda if 'df_eda' in globals() else df
+
+# ensure DURATION is numeric for the quantile calc
+df_eda = df_eda.withColumn("DURATION", col("DURATION").cast("double"))
+
+# median via approxQuantile (ignore nulls)
+median_duration = (
+    df_eda.where(col("DURATION").isNotNull())
+          .approxQuantile("DURATION", [0.5], 0.01)[0]
+)
+
+# fill nulls with the median (and keep as double)
+df_eda = df_eda.withColumn(
+    "DURATION",
+    coalesce(col("DURATION"), lit(float(median_duration))).cast("double")
+)
+
+print(f"Median(DURATION) used for imputation: {median_duration}")
+df_eda.select("DURATION").summary("count","min","50%","max").show()
+
+```
+
+
+# Value names
+```{python}
+df_eda.show(5, truncate=False)
+
+```
+
+# Feature Engineering
+```{python}
+from pyspark.sql.functions import col, pow
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
+from pyspark.ml import Pipeline
+
+# --- 1) Drop rows with NA in required columns (safe: only keep columns that exist) ---
+required_cols = [
+    "SALARY", "MIN_YEARS_EXPERIENCE", "STATE_NAME",
+    "EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME", "MIN_EDULEVELS_NAME",
+    "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING", "MAX_YEARS_EXPERIENCE"
+]
+keep_cols = [c for c in required_cols if c in df_eda.columns]
+df_feature_eng = df_eda.dropna(subset=keep_cols)
+
+# --- 2) Categorical columns (edit if you want fewer/more) ---
+categorical_cols = [
+    "STATE_NAME", "MIN_EDULEVELS_NAME",
+    "EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME",
+    
+]
+categorical_cols = [c for c in categorical_cols if c in df_feature_eng.columns]
+
+# --- 3) StringIndexer + OneHotEncoder ---
+indexers = [
+    StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="skip")
+    for c in categorical_cols
+]
+
+encoder = OneHotEncoder(
+    inputCols=[f"{c}_idx" for c in categorical_cols],
+    outputCols=[f"{c}_vec" for c in categorical_cols],
+    dropLast=True,         # avoid dummy-variable trap
+    handleInvalid="keep"   # keep unseen levels at transform time
+)
+
+# --- 4) Assemble base features (for GLR / RF) ---
+def present(cols):
+    return [c for c in cols if c in df_feature_eng.columns]
+
+numeric_base = present([
+    "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE",
+    "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING" 
+])
+
+assembler = VectorAssembler(
+    inputCols=numeric_base + [f"{c}_vec" for c in categorical_cols],
+    outputCol="features"
+)
+
+# --- 5) Build pipeline and transform ---
+pipeline = Pipeline(stages=indexers + [encoder, assembler])
+data = pipeline.fit(df_feature_eng).transform(df_feature_eng)
+
+# --- 6) Create squared term for polynomial regression ---
+data = data.withColumn(
+    "MIN_YEARS_EXPERIENCE_SQ",
+    pow(col("MIN_YEARS_EXPERIENCE"), 2)
+)
+
+# --- 7) Assemble polynomial features vector ---
+poly_inputs = present([
+    "MIN_YEARS_EXPERIENCE", "MIN_YEARS_EXPERIENCE_SQ",
+    "MAX_YEARS_EXPERIENCE", "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING"
+]) + [f"{c}_vec" for c in categorical_cols]
+
+assembler_poly = VectorAssembler(
+    inputCols=poly_inputs,
+    outputCol="features_poly"
+)
+data = assembler_poly.transform(data)
+
+# --- 8) Show final structure ---
+data.select("SALARY", "features", "features_poly").show(5, truncate=False)
+
+
+
+```
+# Feature Engineering
+```{python}
+#| eval: true
+#| echo: false
+#| fig-align: center
+
+from pyspark.sql.functions import col, pow
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
+from pyspark.ml import Pipeline
+
+# Columns you want to work with
+eda_cols = [
+    "SALARY",
+    "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE", "DURATION",
+    "COMPANY_IS_STAFFING", "IS_INTERNSHIP",
+    "STATE_NAME", "REMOTE_TYPE_NAME", "EMPLOYMENT_TYPE_NAME",
+    "MIN_EDULEVELS_NAME"
+]
+
+# Keep only columns that exist to avoid AnalysisException
+existing_cols = [c for c in eda_cols if c in df.columns]
+missing = [c for c in eda_cols if c not in df.columns]
+if missing:
+    print("⚠️ Skipping missing columns:", missing)
+
+df = df.select(*existing_cols)
+
+# Drop rows with NA in these key fields (use only those that are present)
+subset_needed = [
+    "SALARY", "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE",
+    "EDUCATION_LEVELS_NAME", "EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME",
+    "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING"
+]
+subset_cols = [c for c in subset_needed if c in df.columns]
+df = df.dropna(subset=subset_cols)
+
+
+```
+
+# Indexer
+```{python}
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import StringIndexer
+
+# Choose which categoricals to index (filter to those that exist)
+categorical_cols = ["EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME"]
+categorical_cols = [c for c in categorical_cols if c in df.columns]
+
+# One indexer per categorical
+indexers = [
+    StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep")
+    for c in categorical_cols
+]
+
+# Fit + transform
+pipeline = Pipeline(stages=indexers)
+indexed_df = pipeline.fit(df).transform(df)
+
+indexed_df.show(10, truncate=False)
+
+
+```
+
+YOU ARE HERE AT 2:27 IN VIDDEO
