@@ -18,8 +18,109 @@ format:
     toc-depth: 2
 
 execute:
-  echo: false
-  eval: false
+  echo: true
+  eval: true
   freeze: auto
 ---
 
+# Load the dataset
+```{python}
+#echo: true
+#eval: true
+from pyspark.sql import SparkSession
+import pandas as pd
+import plotly.express as px
+import plotly.io as pio
+import numpy as np
+
+np.random.seed(42)
+
+pio.renderers.default = "notebook+notebook_connected+vscode"
+
+# Initialize Spark Session
+spark = SparkSession.builder.appName("LightcastData").getOrCreate()
+
+# Load Data
+df = spark.read.option("header", "true").option("inferSchema", "true").option("multiLine","true").option("escape", "\"").csv("./data/lightcast_job_postings.csv")
+
+# Show Schema and Sample Data
+print("---This is Diagnostic check, No need to print it in the final doc---")
+
+# df.printSchema() # comment this line when rendering the submission
+df.show(5)
+
+```
+
+# Feature Engineering
+```{python}
+#| eval: true
+#| echo: true
+#| fig-align: center
+
+from pyspark.sql.functions import col, pow  # pow not used here; safe to keep
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
+from pyspark.ml import Pipeline
+
+# Columns to preview for quick EDA
+eda_cols = [
+    "SALARY",
+    "MIN_YEARS_EXPERIENCE", "DURATION",
+    "COMPANY_IS_STAFFING", "IS_INTERNSHIP",
+    "STATE_NAME", "REMOTE_TYPE_NAME", "EMPLOYMENT_TYPE_NAME",
+    "MIN_EDULEVELS_NAME"
+]
+
+# Keep only the columns that actually exist; warn about any missing
+existing_cols = [c for c in eda_cols if c in df.columns]
+missing_cols  = [c for c in eda_cols if c not in df.columns]
+if missing_cols:
+    print("⚠️ Missing columns (skipped):", missing_cols)
+
+# Select and show a few rows
+df_eda = df.select(*existing_cols)
+print("Showing columns:", existing_cols)
+df_eda.show(5, truncate=False)
+
+
+```
+
+# Empty columns plot
+```{python}
+# Missingness by column (nulls + blank strings) + Plotly bar chart
+
+from pyspark.sql.functions import col, sum as spark_sum, when, trim, length
+import pandas as pd
+import plotly.express as px
+
+# Use your EDA subset if it exists; otherwise use the full df
+src = df_eda if 'df_eda' in globals() else df
+
+# 1) Spark: count null OR blank-string cells per column
+null_or_blank_sums = [
+    spark_sum(
+        when(col(c).isNull() | (length(trim(col(c).cast("string"))) == 0), 1).otherwise(0)
+    ).alias(c)
+    for c in src.columns
+]
+missing_df = src.select(null_or_blank_sums)
+
+# 2) To pandas + percentages
+missing_pd = missing_df.toPandas().T.reset_index()
+missing_pd.columns = ["column", "missing_count"]
+total_rows = src.count()
+missing_pd["missing_pct"] = 100.0 * missing_pd["missing_count"] / max(total_rows, 1)
+missing_pd = missing_pd.sort_values("missing_pct", ascending=False)
+
+# 3) Plot
+fig = px.bar(
+    missing_pd,
+    x="column",
+    y="missing_pct",
+    title="Percentage of Missing Values by Column",
+    labels={"column": "Features", "missing_pct": "Missing (%)"}
+)
+fig.update_layout(xaxis_tickangle=-45, height=500, width=900)
+fig
+
+
+```
