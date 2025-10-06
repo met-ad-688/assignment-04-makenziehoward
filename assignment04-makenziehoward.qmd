@@ -124,3 +124,128 @@ fig
 
 
 ```
+
+# Unique values
+```{python}
+from pyspark.sql.functions import countDistinct
+
+# use df_eda if it exists; else fall back to df
+src = df_eda if 'df_eda' in globals() else df
+
+src.select([countDistinct(c).alias(f"{c}_nunique") for c in src.columns]).show(truncate=False)
+
+
+```
+
+# Category counter
+```{python}
+from pyspark.sql.functions import count, desc
+
+# Use your EDA subset if available
+src = df_eda if 'df_eda' in globals() else df
+
+categorical_cols = [
+    "STATE_NAME",
+    "REMOTE_TYPE_NAME",
+    "EMPLOYMENT_TYPE_NAME",
+    "MIN_EDULEVELS_NAME",
+    "COMPANY_IS_STAFFING",
+    "IS_INTERNSHIP",
+]
+
+TOP_N = 50  # how many categories to show per column
+
+for colname in categorical_cols:
+    if colname not in src.columns:
+        print(f"Skipping {colname} (column not found)")
+        continue
+
+    distinct_cnt = src.select(colname).distinct().count()
+    print(f"\n--- {colname} (distinct={distinct_cnt}) ---")
+    (
+        src.groupBy(colname)
+           .agg(count("*").alias("count"))
+           .orderBy(desc("count"))
+           .show(min(TOP_N, distinct_cnt), truncate=False)
+    )
+
+
+```
+
+#  Remote Type Name Fix
+```{python}
+from pyspark.sql.functions import col, when, trim
+
+# Start from df_eda if it exists; otherwise use df
+base = df_eda if 'df_eda' in globals() else df
+
+# Normalize REMOTE_TYPE_NAME values
+df_eda = (
+    base.withColumn(
+        "REMOTE_TYPE_NAME",
+        when(trim(col("REMOTE_TYPE_NAME")) == "Remote", "Remote")
+        .when(trim(col("REMOTE_TYPE_NAME")) == "[None]", "Undefined")
+        .when(trim(col("REMOTE_TYPE_NAME")) == "Not Remote", "On Premise")
+        .when(trim(col("REMOTE_TYPE_NAME")) == "Hybrid Remote", "Hybrid")
+        .when(col("REMOTE_TYPE_NAME").isNull(), "On Premise")
+        .otherwise(col("REMOTE_TYPE_NAME"))
+    )
+)
+
+# df_eda.createOrReplaceTempView("df_eda")  # ← uncomment if you want a SQL temp view
+
+categorical_cols = [
+   "REMOTE_TYPE_NAME",
+    
+]
+
+for colname in categorical_cols:
+    if colname not in df_eda.columns:
+        print(f"⚠️ Skipping {colname} (column not found)")
+        continue
+    print(f"\n--- {colname} ---")
+    df_eda.select(colname).distinct().show(50, truncate=False)
+
+
+```
+
+# Employment type fix
+```{python}
+# Normalize EMPLOYMENT_TYPE_NAME values and inspect them
+
+from pyspark.sql.functions import col, when, trim, lower, regexp_replace, desc, count
+
+# Start from df_eda if it exists; otherwise use df
+base = df_eda if 'df_eda' in globals() else df
+
+# A normalized helper (lowercased, trimmed, single-spaced) for matching
+emp_norm = regexp_replace(lower(trim(col("EMPLOYMENT_TYPE_NAME"))), r"\s+", " ")
+
+df_eda = (
+    base.withColumn(
+        "EMPLOYMENT_TYPE_NAME",
+        when(col("EMPLOYMENT_TYPE_NAME").isNull(), "Fulltime")                                   # NULL → Fulltime
+        .when(emp_norm.isin("part-time / full-time", "part time / full time", "part-time/full-time"),
+              "Flexible")                                                                        # "Part-time / full-time" → Flexible
+        .when(emp_norm.rlike(r"part[- ]?time\s*\((<=|≤)\s*32\s*hours\)"),
+              "Parttime")                                                                        # "Part-time (<=/≤ 32 hours)" → Parttime
+        .when(emp_norm.rlike(r"full[- ]?time\s*\(>\s*32\s*hours\)"),
+              "Fulltime")                                                                        # "Full-time (> 32 hours)" → Fulltime
+        .otherwise(col("EMPLOYMENT_TYPE_NAME"))                                                  # keep others as-is
+    )
+)
+
+# --- Option A: just distinct values (like your screenshot) ---
+print("\n--- EMPLOYMENT_TYPE_NAME (distinct) ---")
+df_eda.select("EMPLOYMENT_TYPE_NAME").distinct().show(50, truncate=False)
+
+# --- Option B: frequency table (more informative) ---
+print("\n--- EMPLOYMENT_TYPE_NAME (counts) ---")
+(df_eda.groupBy("EMPLOYMENT_TYPE_NAME")
+       .agg(count("*").alias("count"))
+       .orderBy(desc("count"))
+       .show(truncate=False))
+
+```
+
+YOU ARE HERE @ 2:07 IN VIDEO
