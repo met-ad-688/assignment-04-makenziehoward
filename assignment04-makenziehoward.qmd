@@ -1,14 +1,14 @@
 ---
 title: Assignment 04
 author:
-  - name: Norah Jones
+  - name: Makenzie Howard
     affiliations:
       - id: bu
         name: Boston University
         city: Boston
         state: MA
 number-sections: true
-date: '2024-11-21'
+date: '2025-10-06'
 date-modified: today
 date-format: long
 format:
@@ -22,3 +22,4 @@ execute:
   eval: false
   freeze: auto
 ---
+
