@@ -51,137 +51,39 @@ df.show(5)
 
 ```
 
-# Feature Engineering
+# Pick EDA Columns and Preview
 ```{python}
 #| eval: true
 #| echo: true
 #| fig-align: center
 
-from pyspark.sql.functions import col, pow  # pow not used here; safe to keep
-from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
-from pyspark.ml import Pipeline
-
-# Columns to preview for quick EDA
+# Keep a consistent working subset for EDA/cleaning
 eda_cols = [
     "SALARY",
-    "MIN_YEARS_EXPERIENCE", "DURATION",
+    "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE", "DURATION",
     "COMPANY_IS_STAFFING", "IS_INTERNSHIP",
     "STATE_NAME", "REMOTE_TYPE_NAME", "EMPLOYMENT_TYPE_NAME",
     "MIN_EDULEVELS_NAME"
 ]
 
-# Keep only the columns that actually exist; warn about any missing
 existing_cols = [c for c in eda_cols if c in df.columns]
 missing_cols  = [c for c in eda_cols if c not in df.columns]
 if missing_cols:
-    print("⚠️ Missing columns (skipped):", missing_cols)
+    print("⚠️ Missing (skipped):", missing_cols)
 
-# Select and show a few rows
 df_eda = df.select(*existing_cols)
-print("Showing columns:", existing_cols)
 df_eda.show(5, truncate=False)
 
 
-```
-
-# Empty columns plot
-```{python}
-# Missingness by column (nulls + blank strings) + Plotly bar chart
-
-from pyspark.sql.functions import col, sum as spark_sum, when, trim, length
-import pandas as pd
-import plotly.express as px
-
-# Use your EDA subset if it exists; otherwise use the full df
-src = df_eda if 'df_eda' in globals() else df
-
-# 1) Spark: count null OR blank-string cells per column
-null_or_blank_sums = [
-    spark_sum(
-        when(col(c).isNull() | (length(trim(col(c).cast("string"))) == 0), 1).otherwise(0)
-    ).alias(c)
-    for c in src.columns
-]
-missing_df = src.select(null_or_blank_sums)
-
-# 2) To pandas + percentages
-missing_pd = missing_df.toPandas().T.reset_index()
-missing_pd.columns = ["column", "missing_count"]
-total_rows = src.count()
-missing_pd["missing_pct"] = 100.0 * missing_pd["missing_count"] / max(total_rows, 1)
-missing_pd = missing_pd.sort_values("missing_pct", ascending=False)
-
-# 3) Plot
-fig = px.bar(
-    missing_pd,
-    x="column",
-    y="missing_pct",
-    title="Percentage of Missing Values by Column",
-    labels={"column": "Features", "missing_pct": "Missing (%)"}
-)
-fig.update_layout(xaxis_tickangle=-45, height=500, width=900)
-fig
-
 
 ```
 
-# Unique values
-```{python}
-from pyspark.sql.functions import countDistinct
-
-# use df_eda if it exists; else fall back to df
-src = df_eda if 'df_eda' in globals() else df
-
-src.select([countDistinct(c).alias(f"{c}_nunique") for c in src.columns]).show(truncate=False)
-
-
-```
-
-# Category counter
-```{python}
-from pyspark.sql.functions import count, desc
-
-# Use your EDA subset if available
-src = df_eda if 'df_eda' in globals() else df
-
-categorical_cols = [
-    "STATE_NAME",
-    "REMOTE_TYPE_NAME",
-    "EMPLOYMENT_TYPE_NAME",
-    "MIN_EDULEVELS_NAME",
-    "COMPANY_IS_STAFFING",
-    "IS_INTERNSHIP",
-]
-
-TOP_N = 50  # how many categories to show per column
-
-for colname in categorical_cols:
-    if colname not in src.columns:
-        print(f"Skipping {colname} (column not found)")
-        continue
-
-    distinct_cnt = src.select(colname).distinct().count()
-    print(f"\n--- {colname} (distinct={distinct_cnt}) ---")
-    (
-        src.groupBy(colname)
-           .agg(count("*").alias("count"))
-           .orderBy(desc("count"))
-           .show(min(TOP_N, distinct_cnt), truncate=False)
-    )
-
-
-```
-
-#  Remote Type Name Fix
+# Normalize REMOTE_TYPE_NAME
 ```{python}
 from pyspark.sql.functions import col, when, trim
 
-# Start from df_eda if it exists; otherwise use df
-base = df_eda if 'df_eda' in globals() else df
-
-# Normalize REMOTE_TYPE_NAME values
 df_eda = (
-    base.withColumn(
+    df_eda.withColumn(
         "REMOTE_TYPE_NAME",
         when(trim(col("REMOTE_TYPE_NAME")) == "Remote", "Remote")
         .when(trim(col("REMOTE_TYPE_NAME")) == "[None]", "Undefined")
@@ -192,268 +94,344 @@ df_eda = (
     )
 )
 
-# df_eda.createOrReplaceTempView("df_eda")  # ← uncomment if you want a SQL temp view
-
-categorical_cols = [
-   "REMOTE_TYPE_NAME",
-    
-]
-
-for colname in categorical_cols:
-    if colname not in df_eda.columns:
-        print(f"⚠️ Skipping {colname} (column not found)")
-        continue
-    print(f"\n--- {colname} ---")
-    df_eda.select(colname).distinct().show(50, truncate=False)
-
-
 ```
 
-# Employment type fix
+# Normalize EMPLOYMENT_NAME_TYPE
 ```{python}
-# Normalize EMPLOYMENT_TYPE_NAME values and inspect them
+from pyspark.sql.functions import lower, regexp_replace
 
-from pyspark.sql.functions import col, when, trim, lower, regexp_replace, desc, count
-
-# Start from df_eda if it exists; otherwise use df
-base = df_eda if 'df_eda' in globals() else df
-
-# A normalized helper (lowercased, trimmed, single-spaced) for matching
 emp_norm = regexp_replace(lower(trim(col("EMPLOYMENT_TYPE_NAME"))), r"\s+", " ")
 
 df_eda = (
-    base.withColumn(
+    df_eda.withColumn(
         "EMPLOYMENT_TYPE_NAME",
-        when(col("EMPLOYMENT_TYPE_NAME").isNull(), "Fulltime")                                   # NULL → Fulltime
-        .when(emp_norm.isin("part-time / full-time", "part time / full time", "part-time/full-time"),
-              "Flexible")                                                                        # "Part-time / full-time" → Flexible
-        .when(emp_norm.rlike(r"part[- ]?time\s*\((<=|≤)\s*32\s*hours\)"),
-              "Parttime")                                                                        # "Part-time (<=/≤ 32 hours)" → Parttime
-        .when(emp_norm.rlike(r"full[- ]?time\s*\(>\s*32\s*hours\)"),
-              "Fulltime")                                                                        # "Full-time (> 32 hours)" → Fulltime
-        .otherwise(col("EMPLOYMENT_TYPE_NAME"))                                                  # keep others as-is
+        when(col("EMPLOYMENT_TYPE_NAME").isNull(), "Fulltime")
+        .when(emp_norm.isin("part-time / full-time", "part time / full time", "part-time/full-time"), "Flexible")
+        .when(emp_norm.rlike(r"part[- ]?time\s*\((<=|≤)\s*32\s*hours\)"), "Parttime")
+        .when(emp_norm.rlike(r"full[- ]?time\s*\(>\s*32\s*hours\)"), "Fulltime")
+        .otherwise(col("EMPLOYMENT_TYPE_NAME"))
     )
 )
 
-# --- Option A: just distinct values (like your screenshot) ---
-print("\n--- EMPLOYMENT_TYPE_NAME (distinct) ---")
-df_eda.select("EMPLOYMENT_TYPE_NAME").distinct().show(50, truncate=False)
-
-# --- Option B: frequency table (more informative) ---
-print("\n--- EMPLOYMENT_TYPE_NAME (counts) ---")
-(df_eda.groupBy("EMPLOYMENT_TYPE_NAME")
-       .agg(count("*").alias("count"))
-       .orderBy(desc("count"))
-       .show(truncate=False))
-
 ```
-# Replace Company is Staffing with false, and is internship null with false
+
+# Fill Boolean Nulls
 ```{python}
-# Replace NULLs with False in COMPANY_IS_STAFFING and IS_INTERNSHIP,
-# then show distinct values (and counts)
+from pyspark.sql.functions import coalesce, lit
 
-from pyspark.sql.functions import col, coalesce, lit, count, desc
+if "COMPANY_IS_STAFFING" in df_eda.columns:
+    df_eda = df_eda.withColumn("COMPANY_IS_STAFFING", coalesce(col("COMPANY_IS_STAFFING"), lit(False)).cast("boolean"))
 
-# start from df_eda if it exists; otherwise use df
-base = df_eda if 'df_eda' in globals() else df
-
-df_eda = (
-    base
-    .withColumn("COMPANY_IS_STAFFING", coalesce(col("COMPANY_IS_STAFFING"), lit(False)).cast("boolean"))
-    .withColumn("IS_INTERNSHIP",       coalesce(col("IS_INTERNSHIP"),       lit(False)).cast("boolean"))
-)
-
-categorical_cols = ["COMPANY_IS_STAFFING", "IS_INTERNSHIP"]
-
-for colname in categorical_cols:
-    if colname not in df_eda.columns:
-        print(f"⚠️ Skipping {colname} (not found)")
-        continue
-    print(f"\n--- {colname} (distinct) ---")
-    df_eda.select(colname).distinct().show(10, truncate=False)
-
-    print(f"--- {colname} (counts) ---")
-    (df_eda.groupBy(colname)
-           .agg(count("*").alias("count"))
-           .orderBy(desc("count"))
-           .show(truncate=False))
-
+if "IS_INTERNSHIP" in df_eda.columns:
+    df_eda = df_eda.withColumn("IS_INTERNSHIP", coalesce(col("IS_INTERNSHIP"), lit(False)).cast("boolean"))
 
 ```
 
-# Calculate median of the Duration column
+#  Impute Duration with the Median
 ```{python}
 from pyspark.sql.functions import col, coalesce, lit
 
-# use df_eda if it exists; otherwise start from df
-df_eda = df_eda if 'df_eda' in globals() else df
+if "DURATION" in df_eda.columns:
+    df_eda = df_eda.withColumn("DURATION", col("DURATION").cast("double"))
+    med = (
+        df_eda.where(col("DURATION").isNotNull())
+              .approxQuantile("DURATION", [0.5], 0.01)[0]
+    )
+    df_eda = df_eda.withColumn("DURATION", coalesce(col("DURATION"), lit(float(med))).cast("double"))
+    print(f"Imputed DURATION median: {med}")
 
-# ensure DURATION is numeric for the quantile calc
-df_eda = df_eda.withColumn("DURATION", col("DURATION").cast("double"))
-
-# median via approxQuantile (ignore nulls)
-median_duration = (
-    df_eda.where(col("DURATION").isNotNull())
-          .approxQuantile("DURATION", [0.5], 0.01)[0]
-)
-
-# fill nulls with the median (and keep as double)
-df_eda = df_eda.withColumn(
-    "DURATION",
-    coalesce(col("DURATION"), lit(float(median_duration))).cast("double")
-)
-
-print(f"Median(DURATION) used for imputation: {median_duration}")
-df_eda.select("DURATION").summary("count","min","50%","max").show()
 
 ```
 
-
-# Value names
+# Vectorize STATE_NAME and MIN_EDULEVELS_NAME
 ```{python}
-df_eda.show(5, truncate=False)
+# Chunk 7 — Clean SALARY, pick 3 continuous, vectorize STATE_NAME & MIN_EDULEVELS_NAME,
+# build `features` and `features_poly`, then FILTER to non-null numeric label
 
-```
+import re
+from decimal import Decimal
 
-# Feature Engineering
-```{python}
-from pyspark.sql.functions import col, pow
+import pyspark.sql.functions as F
+from pyspark.sql.functions import col, trim, length, when, isnan, pow
+from pyspark.sql.types import DoubleType
 from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
 from pyspark.ml import Pipeline
 
-# --- 1) Drop rows with NA in required columns (safe: only keep columns that exist) ---
-required_cols = [
-    "SALARY", "MIN_YEARS_EXPERIENCE", "STATE_NAME",
-    "EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME", "MIN_EDULEVELS_NAME",
-    "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING", "MAX_YEARS_EXPERIENCE"
-]
-keep_cols = [c for c in required_cols if c in df_eda.columns]
-df_feature_eng = df_eda.dropna(subset=keep_cols)
+# ----- Base frame from earlier EDA -----
+base = df_eda if 'df_eda' in globals() else df
 
-# --- 2) Categorical columns (edit if you want fewer/more) ---
-categorical_cols = [
-    "STATE_NAME", "MIN_EDULEVELS_NAME",
-    "EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME",
-    
-]
-categorical_cols = [c for c in categorical_cols if c in df_feature_eng.columns]
+LABEL_COL  = "SALARY"
+MINEXP_COL = "MIN_YEARS_EXPERIENCE"
 
-# --- 3) StringIndexer + OneHotEncoder ---
-indexers = [
-    StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="skip")
-    for c in categorical_cols
-]
+# =========================================
+# 0) Robust SALARY cleaning (numeric, $, commas, k/K, ranges)
+# =========================================
+def _parse_salary_any(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, float, Decimal)):  # already numeric
+        v = float(x)
+        return v if v == v else None  # NaN guard
+    s = str(x).strip().lower()
+    if not s:
+        return None
+    s = s.replace(",", " ")                      # normalize thousands
+    tokens = re.findall(r'(\d+(?:\.\d+)?\s*k?)', s)
 
-encoder = OneHotEncoder(
+    def to_num(tok: str):
+        t = tok.replace(" ", "")
+        mult = 1000.0 if t.endswith("k") else 1.0
+        if t.endswith("k"):
+            t = t[:-1]
+        try:
+            return float(t) * mult
+        except:
+            return None
+
+    nums = [n for n in (to_num(t) for t in tokens) if n is not None]
+    if not nums:
+        return None
+    return float(sum(nums[:2]) / 2.0) if len(nums) >= 2 else float(nums[0])
+
+parse_salary_udf = F.udf(_parse_salary_any, DoubleType())
+base = base.withColumn(LABEL_COL, parse_salary_udf(col(LABEL_COL)))
+
+# Ensure MINEXP is numeric
+base = base.withColumn(MINEXP_COL, col(MINEXP_COL).cast("double"))
+
+# =========================================
+# 1) Choose EXACTLY 3 continuous features (robust picking + impute)
+# =========================================
+preferred_real = [c for c in ["DURATION", "MODELED_DURATION", "DUPLICATES", "MAX_YEARS_EXPERIENCE"]
+                  if c in base.columns]
+
+continuous_cols = []
+for c in preferred_real:
+    base = base.withColumn(c, col(c).cast("double"))
+    med_list = base.where(col(c).isNotNull()).approxQuantile(c, [0.5], 0.01)
+    med = float(med_list[0]) if med_list else 0.0
+    base = base.withColumn(c, F.coalesce(col(c), F.lit(med)))
+    continuous_cols.append(c)
+    if len(continuous_cols) == 3:
+        break
+
+# Engineer from DURATION if we still need more
+if len(continuous_cols) < 3 and "DURATION" in base.columns:
+    if "DURATION_LOG1P" not in base.columns:
+        base = base.withColumn("DURATION_LOG1P", F.log1p(col("DURATION").cast("double")))
+    continuous_cols.append("DURATION_LOG1P")
+if len(continuous_cols) < 3 and "DURATION" in base.columns:
+    if "DURATION_SQRT" not in base.columns:
+        base = base.withColumn("DURATION_SQRT", F.sqrt(col("DURATION").cast("double")))
+    continuous_cols.append("DURATION_SQRT")
+
+continuous_cols = continuous_cols[:3]
+if len(continuous_cols) < 3:
+    raise ValueError(f"Only found {continuous_cols}. Add another numeric to meet 3 continuous features.")
+
+# =========================================
+# 2) EXACTLY 2 categoricals required by the prompt
+# =========================================
+categorical_cols = [c for c in ["STATE_NAME", "MIN_EDULEVELS_NAME"] if c in base.columns]
+
+print("Using features:")
+print("  y:", LABEL_COL)
+print("  must-have:", MINEXP_COL)
+print("  continuous (3):", continuous_cols)
+print("  categorical (2):", categorical_cols)
+
+# =========================================
+# 3) Drop rows missing in the training columns (includes label)
+# =========================================
+key_cols = [LABEL_COL, MINEXP_COL] + continuous_cols + categorical_cols
+df_feat = base.dropna(subset=key_cols)
+
+# =========================================
+# 4) Index + One-Hot, assemble `features`
+# =========================================
+indexers = [StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep") for c in categorical_cols]
+encoder  = OneHotEncoder(
     inputCols=[f"{c}_idx" for c in categorical_cols],
     outputCols=[f"{c}_vec" for c in categorical_cols],
-    dropLast=True,         # avoid dummy-variable trap
-    handleInvalid="keep"   # keep unseen levels at transform time
+    handleInvalid="keep",
+    dropLast=True
+)
+assembler_inputs = [MINEXP_COL] + continuous_cols + [f"{c}_vec" for c in categorical_cols]
+assembler = VectorAssembler(inputCols=assembler_inputs, outputCol="features")
+
+pipe = Pipeline(stages=indexers + [encoder, assembler])
+vec_model = pipe.fit(df_feat)
+data_exact = vec_model.transform(df_feat)
+
+# =========================================
+# 5) Polynomial piece: features_poly = [MINEXP, MINEXP^2]
+# =========================================
+data_exact = data_exact.withColumn(f"{MINEXP_COL}_SQ", pow(col(MINEXP_COL), 2.0))
+poly_asm = VectorAssembler(inputCols=[MINEXP_COL, f"{MINEXP_COL}_SQ"], outputCol="features_poly")
+data_exact = poly_asm.transform(data_exact)
+
+# =========================================
+# 6) **FINAL LABEL CLEAN** — keep only rows with a usable numeric SALARY
+# =========================================
+data_exact = data_exact.filter(col(LABEL_COL).isNotNull() & ~isnan(col(LABEL_COL)))
+
+# Quick diagnostics
+data_exact.select(
+    F.count("*").alias("rows"),
+    F.sum(col(LABEL_COL).isNull().cast("int")).alias("salary_nulls"),
+    F.sum(isnan(col(LABEL_COL)).cast("int")).alias("salary_nans")
+).show()
+
+# Small proof
+data_exact.select(LABEL_COL, "features", "features_poly").show(5, truncate=False)
+
+```
+
+# Train/Test split with seed
+```{python}
+# Chunk 8 — Train/Test split with seed (uses CLEAN label frame)
+
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, isnan
+
+SEED = 42
+TRAIN_FRAC = 0.80  # justify: common default; good bias/variance tradeoff
+
+# Always split from the cleaned engineered frame (built in Chunk 7)
+if 'data_exact' not in globals():
+    raise ValueError("Run Chunk 7 first to create `data_exact`.")
+
+src = data_exact  # already filtered to non-null numeric SALARY
+
+# Safety checks
+for c in ["SALARY", "features"]:
+    if c not in src.columns:
+        raise ValueError(f"Column {c} missing in engineered frame. Re-run Chunk 7.")
+
+# Split
+train_df, test_df = src.randomSplit([TRAIN_FRAC, 1 - TRAIN_FRAC], seed=SEED)
+train_df.cache(); test_df.cache()
+
+# Report sizes + verify no null labels
+n_total, n_train, n_test = src.count(), train_df.count(), test_df.count()
+print("=== Train/Test Split ===")
+print(f"Seed: {SEED} | Split: {TRAIN_FRAC:.0%}/{1-TRAIN_FRAC:.0%}")
+print(f"Total: {n_total:,} | Train: {n_train:,} | Test: {n_test:,}")
+
+for name, d in [("TRAIN", train_df), ("TEST", test_df)]:
+    print(f"\n— {name} SALARY null check —")
+    d.select(F.sum(col("SALARY").isNull().cast("int")).alias("salary_nulls")).show()
+
+# Peek vectors
+print("\n— TRAIN sample —")
+train_df.select("SALARY", "features").show(5, truncate=80)
+
+
+```
+
+# Linear Regression Model (OLS)
+```{python}
+# Chunk 9 — Regression prep that ALSO cleans the label
+
+import re
+from decimal import Decimal
+import pyspark.sql.functions as F
+from pyspark.sql.functions import col, trim, regexp_replace, isnan
+from pyspark.sql.types import DoubleType
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
+from pyspark.ml import Pipeline
+
+# --- Reuse or (re)define the salary parser in case it's out of scope ---
+def _parse_salary_any(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, float, Decimal)):
+        v = float(x)
+        return v if v == v else None
+    s = str(x).strip().lower()
+    if not s:
+        return None
+    s = s.replace(",", " ")
+    tokens = re.findall(r'(\d+(?:\.\d+)?\s*k?)', s)
+
+    def to_num(tok: str):
+        t = tok.replace(" ", "")
+        mult = 1000.0 if t.endswith("k") else 1.0
+        if t.endswith("k"):
+            t = t[:-1]
+        try:
+            return float(t) * mult
+        except:
+            return None
+
+    nums = [n for n in (to_num(t) for t in tokens) if n is not None]
+    if not nums:
+        return None
+    return float(sum(nums[:2]) / 2.0) if len(nums) >= 2 else float(nums[0])
+
+parse_salary_udf = F.udf(_parse_salary_any, DoubleType())
+
+# --- Start from df_eda, but CLEAN the label before anything else ---
+regression_df = df_eda
+
+regression_df = regression_df.withColumn("SALARY", parse_salary_udf(col("SALARY")))
+regression_df = regression_df.filter(col("SALARY").isNotNull() & ~isnan(col("SALARY")))
+
+# Optional: tidy EDUCATION_LEVELS_NAME text if you use it
+if "EDUCATION_LEVELS_NAME" in regression_df.columns:
+    regression_df = regression_df.withColumn(
+        "EDUCATION_LEVELS_NAME",
+        trim(regexp_replace(col("EDUCATION_LEVELS_NAME"), r"[\[\]\n]", ""))
+    )
+
+# --- Numerics (cast + median impute to avoid assembler nulls) ---
+numeric_inputs = [c for c in [
+    "MIN_YEARS_EXPERIENCE",
+    "MAX_YEARS_EXPERIENCE",
+    "DURATION",
+    "IS_INTERNSHIP",
+    "COMPANY_IS_STAFFING",
+] if c in regression_df.columns]
+
+for c in numeric_inputs:
+    regression_df = regression_df.withColumn(c, col(c).cast("double"))
+    med = regression_df.where(col(c).isNotNull()).approxQuantile(c, [0.5], 0.01)
+    med = float(med[0]) if med else 0.0
+    regression_df = regression_df.withColumn(c, F.coalesce(col(c), F.lit(med)))
+
+# --- Categoricals (use only what exists) ---
+categorical_cols = [c for c in [
+    "STATE_NAME",
+    "MIN_EDULEVELS_NAME",
+    "EMPLOYMENT_TYPE_NAME",
+    "REMOTE_TYPE_NAME",
+    "EDUCATION_LEVELS_NAME",
+] if c in regression_df.columns]
+
+indexers = [StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep") for c in categorical_cols]
+encoders = OneHotEncoder(
+    inputCols=[f"{c}_idx" for c in categorical_cols],
+    outputCols=[f"{c}_vec" for c in categorical_cols],
+    handleInvalid="keep",
+    dropLast=True,
 )
 
-# --- 4) Assemble base features (for GLR / RF) ---
-def present(cols):
-    return [c for c in cols if c in df_feature_eng.columns]
-
-numeric_base = present([
-    "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE",
-    "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING" 
-])
-
 assembler = VectorAssembler(
-    inputCols=numeric_base + [f"{c}_vec" for c in categorical_cols],
+    inputCols=numeric_inputs + [f"{c}_vec" for c in categorical_cols],
     outputCol="features"
 )
 
-# --- 5) Build pipeline and transform ---
-pipeline = Pipeline(stages=indexers + [encoder, assembler])
-data = pipeline.fit(df_feature_eng).transform(df_feature_eng)
+pipeline = Pipeline(stages=indexers + [encoders, assembler])
+regression_data = pipeline.fit(regression_df).transform(regression_df)
 
-# --- 6) Create squared term for polynomial regression ---
-data = data.withColumn(
-    "MIN_YEARS_EXPERIENCE_SQ",
-    pow(col("MIN_YEARS_EXPERIENCE"), 2)
-)
+# Diagnostics: prove there are no null labels here either
+regression_data.select(
+    F.count("*").alias("rows"),
+    F.sum(col("SALARY").isNull().cast("int")).alias("salary_nulls")
+).show()
 
-# --- 7) Assemble polynomial features vector ---
-poly_inputs = present([
-    "MIN_YEARS_EXPERIENCE", "MIN_YEARS_EXPERIENCE_SQ",
-    "MAX_YEARS_EXPERIENCE", "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING"
-]) + [f"{c}_vec" for c in categorical_cols]
-
-assembler_poly = VectorAssembler(
-    inputCols=poly_inputs,
-    outputCol="features_poly"
-)
-data = assembler_poly.transform(data)
-
-# --- 8) Show final structure ---
-data.select("SALARY", "features", "features_poly").show(5, truncate=False)
-
-
+print("Numeric inputs:", numeric_inputs)
+print("Categoricals:", categorical_cols)
+regression_data.select("SALARY", "features").show(5, truncate=False)
 
 ```
-# Feature Engineering
-```{python}
-#| eval: true
-#| echo: false
-#| fig-align: center
-
-from pyspark.sql.functions import col, pow
-from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
-from pyspark.ml import Pipeline
-
-# Columns you want to work with
-eda_cols = [
-    "SALARY",
-    "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE", "DURATION",
-    "COMPANY_IS_STAFFING", "IS_INTERNSHIP",
-    "STATE_NAME", "REMOTE_TYPE_NAME", "EMPLOYMENT_TYPE_NAME",
-    "MIN_EDULEVELS_NAME"
-]
-
-# Keep only columns that exist to avoid AnalysisException
-existing_cols = [c for c in eda_cols if c in df.columns]
-missing = [c for c in eda_cols if c not in df.columns]
-if missing:
-    print("⚠️ Skipping missing columns:", missing)
-
-df = df.select(*existing_cols)
-
-# Drop rows with NA in these key fields (use only those that are present)
-subset_needed = [
-    "SALARY", "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE",
-    "EDUCATION_LEVELS_NAME", "EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME",
-    "DURATION", "IS_INTERNSHIP", "COMPANY_IS_STAFFING"
-]
-subset_cols = [c for c in subset_needed if c in df.columns]
-df = df.dropna(subset=subset_cols)
-
-
-```
-
-# Indexer
-```{python}
-from pyspark.ml import Pipeline
-from pyspark.ml.feature import StringIndexer
-
-# Choose which categoricals to index (filter to those that exist)
-categorical_cols = ["EMPLOYMENT_TYPE_NAME", "REMOTE_TYPE_NAME"]
-categorical_cols = [c for c in categorical_cols if c in df.columns]
-
-# One indexer per categorical
-indexers = [
-    StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep")
-    for c in categorical_cols
-]
-
-# Fit + transform
-pipeline = Pipeline(stages=indexers)
-indexed_df = pipeline.fit(df).transform(df)
-
-indexed_df.show(10, truncate=False)
-
-
-```
-
-YOU ARE HERE AT 2:27 IN VIDDEO
