@@ -53,202 +53,136 @@ df.show(5)
 
 # Pick EDA Columns and Preview
 ```{python}
-#| eval: true
 #| echo: true
-#| fig-align: center
-
-# Keep a consistent working subset for EDA/cleaning
 eda_cols = [
     "SALARY",
-    "MIN_YEARS_EXPERIENCE", "MAX_YEARS_EXPERIENCE", "DURATION",
-    "COMPANY_IS_STAFFING", "IS_INTERNSHIP",
-    "STATE_NAME", "REMOTE_TYPE_NAME", "EMPLOYMENT_TYPE_NAME",
+    "MIN_YEARS_EXPERIENCE","MAX_YEARS_EXPERIENCE","DURATION",
+    "COMPANY_IS_STAFFING","IS_INTERNSHIP",
+    "STATE_NAME","REMOTE_TYPE_NAME","EMPLOYMENT_TYPE_NAME",
     "MIN_EDULEVELS_NAME"
 ]
+existing = [c for c in eda_cols if c in df.columns]
+missing  = [c for c in eda_cols if c not in df.columns]
+if missing:
+    print("Missing (skipped):", missing)
 
-existing_cols = [c for c in eda_cols if c in df.columns]
-missing_cols  = [c for c in eda_cols if c not in df.columns]
-if missing_cols:
-    print("⚠️ Missing (skipped):", missing_cols)
-
-df_eda = df.select(*existing_cols)
+df_eda = df.select(*existing)
 df_eda.show(5, truncate=False)
-
 
 
 ```
 
-# Normalize REMOTE_TYPE_NAME
+# Clean Categoricals and imputations
 ```{python}
-from pyspark.sql.functions import col, when, trim
+#| echo: true
+from pyspark.sql.functions import col, when, trim, lower, regexp_replace, coalesce, lit
 
-df_eda = (
-    df_eda.withColumn(
-        "REMOTE_TYPE_NAME",
-        when(trim(col("REMOTE_TYPE_NAME")) == "Remote", "Remote")
-        .when(trim(col("REMOTE_TYPE_NAME")) == "[None]", "Undefined")
-        .when(trim(col("REMOTE_TYPE_NAME")) == "Not Remote", "On Premise")
-        .when(trim(col("REMOTE_TYPE_NAME")) == "Hybrid Remote", "Hybrid")
-        .when(col("REMOTE_TYPE_NAME").isNull(), "On Premise")
+# REMOTE_TYPE_NAME normalize
+df_eda = (df_eda
+    .withColumn("REMOTE_TYPE_NAME",
+        when(trim(col("REMOTE_TYPE_NAME")) == "Remote","Remote")
+        .when(trim(col("REMOTE_TYPE_NAME")) == "[None]","Undefined")
+        .when(trim(col("REMOTE_TYPE_NAME")) == "Not Remote","On Premise")
+        .when(trim(col("REMOTE_TYPE_NAME")) == "Hybrid Remote","Hybrid")
+        .when(col("REMOTE_TYPE_NAME").isNull(),"On Premise")
         .otherwise(col("REMOTE_TYPE_NAME"))
     )
 )
 
-```
-
-# Normalize EMPLOYMENT_NAME_TYPE
-```{python}
-from pyspark.sql.functions import lower, regexp_replace
-
+# EMPLOYMENT_TYPE_NAME normalize
 emp_norm = regexp_replace(lower(trim(col("EMPLOYMENT_TYPE_NAME"))), r"\s+", " ")
-
-df_eda = (
-    df_eda.withColumn(
-        "EMPLOYMENT_TYPE_NAME",
-        when(col("EMPLOYMENT_TYPE_NAME").isNull(), "Fulltime")
-        .when(emp_norm.isin("part-time / full-time", "part time / full time", "part-time/full-time"), "Flexible")
-        .when(emp_norm.rlike(r"part[- ]?time\s*\((<=|≤)\s*32\s*hours\)"), "Parttime")
-        .when(emp_norm.rlike(r"full[- ]?time\s*\(>\s*32\s*hours\)"), "Fulltime")
+df_eda = (df_eda
+    .withColumn("EMPLOYMENT_TYPE_NAME",
+        when(col("EMPLOYMENT_TYPE_NAME").isNull(),"Fulltime")
+        .when(emp_norm.isin("part-time / full-time","part time / full time","part-time/full-time"),"Flexible")
+        .when(emp_norm.rlike(r"part[- ]?time\s*\((<=|≤)\s*32\s*hours\)"),"Parttime")
+        .when(emp_norm.rlike(r"full[- ]?time\s*\(>\s*32\s*hours\)"),"Fulltime")
         .otherwise(col("EMPLOYMENT_TYPE_NAME"))
     )
 )
 
-```
-
-# Fill Boolean Nulls
-```{python}
-from pyspark.sql.functions import coalesce, lit
-
+# Booleans → fill nulls
 if "COMPANY_IS_STAFFING" in df_eda.columns:
-    df_eda = df_eda.withColumn("COMPANY_IS_STAFFING", coalesce(col("COMPANY_IS_STAFFING"), lit(False)).cast("boolean"))
-
+    df_eda = df_eda.withColumn("COMPANY_IS_STAFFING", coalesce(col("COMPANY_IS_STAFFING"), lit(False)).cast("double"))
 if "IS_INTERNSHIP" in df_eda.columns:
-    df_eda = df_eda.withColumn("IS_INTERNSHIP", coalesce(col("IS_INTERNSHIP"), lit(False)).cast("boolean"))
+    df_eda = df_eda.withColumn("IS_INTERNSHIP", coalesce(col("IS_INTERNSHIP"), lit(False)).cast("double"))
 
-```
-
-#  Impute Duration with the Median
-```{python}
-from pyspark.sql.functions import col, coalesce, lit
-
+# DURATION → numeric + median fill
 if "DURATION" in df_eda.columns:
     df_eda = df_eda.withColumn("DURATION", col("DURATION").cast("double"))
-    med = (
-        df_eda.where(col("DURATION").isNotNull())
-              .approxQuantile("DURATION", [0.5], 0.01)[0]
-    )
+    med = df_eda.where(col("DURATION").isNotNull()).approxQuantile("DURATION",[0.5],0.01)[0]
     df_eda = df_eda.withColumn("DURATION", coalesce(col("DURATION"), lit(float(med))).cast("double"))
-    print(f"Imputed DURATION median: {med}")
+    print("Imputed DURATION median:", med)
 
+df_eda.show(5, truncate=False)
 
 ```
+
 
 # Vectorize STATE_NAME and MIN_EDULEVELS_NAME
 ```{python}
-# Chunk 7 — Clean SALARY, pick 3 continuous, vectorize STATE_NAME & MIN_EDULEVELS_NAME,
-# build `features` and `features_poly`, then FILTER to non-null numeric label
-
+#| echo: true
 import re
 from decimal import Decimal
-
 import pyspark.sql.functions as F
-from pyspark.sql.functions import col, trim, length, when, isnan, pow
+from pyspark.sql.functions import col, pow
 from pyspark.sql.types import DoubleType
-from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
 from pyspark.ml import Pipeline
-
-# ----- Base frame from earlier EDA -----
-base = df_eda if 'df_eda' in globals() else df
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
 
 LABEL_COL  = "SALARY"
 MINEXP_COL = "MIN_YEARS_EXPERIENCE"
 
-# =========================================
-# 0) Robust SALARY cleaning (numeric, $, commas, k/K, ranges)
-# =========================================
 def _parse_salary_any(x):
-    if x is None:
-        return None
-    if isinstance(x, (int, float, Decimal)):  # already numeric
-        v = float(x)
-        return v if v == v else None  # NaN guard
+    if x is None: return None
+    if isinstance(x,(int,float,Decimal)):
+        v = float(x); return v if v == v else None
     s = str(x).strip().lower()
-    if not s:
-        return None
-    s = s.replace(",", " ")                      # normalize thousands
+    if not s: return None
+    s = s.replace(","," ")
     tokens = re.findall(r'(\d+(?:\.\d+)?\s*k?)', s)
-
-    def to_num(tok: str):
-        t = tok.replace(" ", "")
+    def to_num(tok):
+        t = tok.replace(" ","")
         mult = 1000.0 if t.endswith("k") else 1.0
-        if t.endswith("k"):
-            t = t[:-1]
-        try:
-            return float(t) * mult
-        except:
-            return None
-
+        if t.endswith("k"): t = t[:-1]
+        try: return float(t)*mult
+        except: return None
     nums = [n for n in (to_num(t) for t in tokens) if n is not None]
-    if not nums:
-        return None
-    return float(sum(nums[:2]) / 2.0) if len(nums) >= 2 else float(nums[0])
+    if not nums: return None
+    return float(sum(nums[:2])/2.0) if len(nums)>=2 else float(nums[0])
 
 parse_salary_udf = F.udf(_parse_salary_any, DoubleType())
-base = base.withColumn(LABEL_COL, parse_salary_udf(col(LABEL_COL)))
 
-# Ensure MINEXP is numeric
-base = base.withColumn(MINEXP_COL, col(MINEXP_COL).cast("double"))
+base = (df_eda
+    .withColumn(LABEL_COL, parse_salary_udf(col(LABEL_COL)))
+    .withColumn(MINEXP_COL, col(MINEXP_COL).cast("double"))
+)
 
-# =========================================
-# 1) Choose EXACTLY 3 continuous features (robust picking + impute)
-# =========================================
-preferred_real = [c for c in ["DURATION", "MODELED_DURATION", "DUPLICATES", "MAX_YEARS_EXPERIENCE"]
-                  if c in base.columns]
-
+# pick 3 continuous
+preferred = [c for c in ["DURATION","MODELED_DURATION","DUPLICATES","MAX_YEARS_EXPERIENCE"] if c in base.columns]
 continuous_cols = []
-for c in preferred_real:
+for c in preferred:
     base = base.withColumn(c, col(c).cast("double"))
-    med_list = base.where(col(c).isNotNull()).approxQuantile(c, [0.5], 0.01)
+    med_list = base.where(col(c).isNotNull()).approxQuantile(c,[0.5],0.01)
     med = float(med_list[0]) if med_list else 0.0
     base = base.withColumn(c, F.coalesce(col(c), F.lit(med)))
     continuous_cols.append(c)
-    if len(continuous_cols) == 3:
-        break
-
-# Engineer from DURATION if we still need more
-if len(continuous_cols) < 3 and "DURATION" in base.columns:
-    if "DURATION_LOG1P" not in base.columns:
-        base = base.withColumn("DURATION_LOG1P", F.log1p(col("DURATION").cast("double")))
+    if len(continuous_cols)==3: break
+if len(continuous_cols)<3 and "DURATION" in base.columns:
+    base = base.withColumn("DURATION_LOG1P", F.log1p(col("DURATION")))
     continuous_cols.append("DURATION_LOG1P")
-if len(continuous_cols) < 3 and "DURATION" in base.columns:
-    if "DURATION_SQRT" not in base.columns:
-        base = base.withColumn("DURATION_SQRT", F.sqrt(col("DURATION").cast("double")))
+if len(continuous_cols)<3 and "DURATION" in base.columns:
+    base = base.withColumn("DURATION_SQRT", F.sqrt(col("DURATION")))
     continuous_cols.append("DURATION_SQRT")
-
 continuous_cols = continuous_cols[:3]
-if len(continuous_cols) < 3:
-    raise ValueError(f"Only found {continuous_cols}. Add another numeric to meet 3 continuous features.")
 
-# =========================================
-# 2) EXACTLY 2 categoricals required by the prompt
-# =========================================
-categorical_cols = [c for c in ["STATE_NAME", "MIN_EDULEVELS_NAME"] if c in base.columns]
+categorical_cols = [c for c in ["STATE_NAME","MIN_EDULEVELS_NAME"] if c in base.columns]
 
-print("Using features:")
-print("  y:", LABEL_COL)
-print("  must-have:", MINEXP_COL)
-print("  continuous (3):", continuous_cols)
-print("  categorical (2):", categorical_cols)
-
-# =========================================
-# 3) Drop rows missing in the training columns (includes label)
-# =========================================
+# drop rows missing the exact training columns
 key_cols = [LABEL_COL, MINEXP_COL] + continuous_cols + categorical_cols
 df_feat = base.dropna(subset=key_cols)
 
-# =========================================
-# 4) Index + One-Hot, assemble `features`
-# =========================================
+# index + ohe + assemble
 indexers = [StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep") for c in categorical_cols]
 encoder  = OneHotEncoder(
     inputCols=[f"{c}_idx" for c in categorical_cols],
@@ -259,60 +193,41 @@ encoder  = OneHotEncoder(
 assembler_inputs = [MINEXP_COL] + continuous_cols + [f"{c}_vec" for c in categorical_cols]
 assembler = VectorAssembler(inputCols=assembler_inputs, outputCol="features")
 
-pipe = Pipeline(stages=indexers + [encoder, assembler])
-vec_model = pipe.fit(df_feat)
+vec_model = Pipeline(stages=indexers + [encoder, assembler]).fit(df_feat)
 data_exact = vec_model.transform(df_feat)
 
-# =========================================
-# 5) Polynomial piece: features_poly = [MINEXP, MINEXP^2]
-# =========================================
+# polynomial vector
 data_exact = data_exact.withColumn(f"{MINEXP_COL}_SQ", pow(col(MINEXP_COL), 2.0))
 poly_asm = VectorAssembler(inputCols=[MINEXP_COL, f"{MINEXP_COL}_SQ"], outputCol="features_poly")
 data_exact = poly_asm.transform(data_exact)
 
-# =========================================
-# 6) **FINAL LABEL CLEAN** — keep only rows with a usable numeric SALARY
-# =========================================
-data_exact = data_exact.filter(col(LABEL_COL).isNotNull() & ~isnan(col(LABEL_COL)))
-
-# Quick diagnostics
-data_exact.select(
-    F.count("*").alias("rows"),
-    F.sum(col(LABEL_COL).isNull().cast("int")).alias("salary_nulls"),
-    F.sum(isnan(col(LABEL_COL)).cast("int")).alias("salary_nans")
-).show()
-
-# Small proof
-data_exact.select(LABEL_COL, "features", "features_poly").show(5, truncate=False)
+print("Using features:")
+print("  y:", LABEL_COL)
+print("  must-have:", MINEXP_COL)
+print("  continuous (3):", continuous_cols)
+print("  categorical (2):", categorical_cols)
+data_exact.select(LABEL_COL,"features","features_poly").show(5, truncate=False)
 
 ```
 
 # Train/Test split with seed
 ```{python}
-# Chunk 8 — Train/Test split with seed (uses CLEAN label frame)
-
+#| echo: true
+from pyspark.sql.functions import col
 from pyspark.sql import functions as F
-from pyspark.sql.functions import col, isnan
 
 SEED = 42
-TRAIN_FRAC = 0.80  # justify: common default; good bias/variance tradeoff
+TRAIN_FRAC = 0.80
 
-# Always split from the cleaned engineered frame (built in Chunk 7)
-if 'data_exact' not in globals():
-    raise ValueError("Run Chunk 7 first to create `data_exact`.")
+src = data_exact
 
-src = data_exact  # already filtered to non-null numeric SALARY
+# safety
+for c in ["SALARY","features"]:
+    assert c in src.columns, f"Missing column: {c}"
 
-# Safety checks
-for c in ["SALARY", "features"]:
-    if c not in src.columns:
-        raise ValueError(f"Column {c} missing in engineered frame. Re-run Chunk 7.")
-
-# Split
-train_df, test_df = src.randomSplit([TRAIN_FRAC, 1 - TRAIN_FRAC], seed=SEED)
+train_df, test_df = src.randomSplit([TRAIN_FRAC, 1-TRAIN_FRAC], seed=SEED)
 train_df.cache(); test_df.cache()
 
-# Report sizes + verify no null labels
 n_total, n_train, n_test = src.count(), train_df.count(), test_df.count()
 print("=== Train/Test Split ===")
 print(f"Seed: {SEED} | Split: {TRAIN_FRAC:.0%}/{1-TRAIN_FRAC:.0%}")
@@ -322,117 +237,622 @@ for name, d in [("TRAIN", train_df), ("TEST", test_df)]:
     print(f"\n— {name} SALARY null check —")
     d.select(F.sum(col("SALARY").isNull().cast("int")).alias("salary_nulls")).show()
 
-# Peek vectors
-print("\n— TRAIN sample —")
-train_df.select("SALARY", "features").show(5, truncate=80)
-
 
 ```
 
-# Linear Regression Model (OLS)
+# Linear Regression Model (OLS) Prep and Training
 ```{python}
-# Chunk 9 — Regression prep that ALSO cleans the label
+#| echo: true
+from pyspark.ml.regression import GeneralizedLinearRegression
 
-import re
-from decimal import Decimal
-import pyspark.sql.functions as F
-from pyspark.sql.functions import col, trim, regexp_replace, isnan
-from pyspark.sql.types import DoubleType
-from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
-from pyspark.ml import Pipeline
-
-# --- Reuse or (re)define the salary parser in case it's out of scope ---
-def _parse_salary_any(x):
-    if x is None:
-        return None
-    if isinstance(x, (int, float, Decimal)):
-        v = float(x)
-        return v if v == v else None
-    s = str(x).strip().lower()
-    if not s:
-        return None
-    s = s.replace(",", " ")
-    tokens = re.findall(r'(\d+(?:\.\d+)?\s*k?)', s)
-
-    def to_num(tok: str):
-        t = tok.replace(" ", "")
-        mult = 1000.0 if t.endswith("k") else 1.0
-        if t.endswith("k"):
-            t = t[:-1]
-        try:
-            return float(t) * mult
-        except:
-            return None
-
-    nums = [n for n in (to_num(t) for t in tokens) if n is not None]
-    if not nums:
-        return None
-    return float(sum(nums[:2]) / 2.0) if len(nums) >= 2 else float(nums[0])
-
-parse_salary_udf = F.udf(_parse_salary_any, DoubleType())
-
-# --- Start from df_eda, but CLEAN the label before anything else ---
-regression_df = df_eda
-
-regression_df = regression_df.withColumn("SALARY", parse_salary_udf(col("SALARY")))
-regression_df = regression_df.filter(col("SALARY").isNotNull() & ~isnan(col("SALARY")))
-
-# Optional: tidy EDUCATION_LEVELS_NAME text if you use it
-if "EDUCATION_LEVELS_NAME" in regression_df.columns:
-    regression_df = regression_df.withColumn(
-        "EDUCATION_LEVELS_NAME",
-        trim(regexp_replace(col("EDUCATION_LEVELS_NAME"), r"[\[\]\n]", ""))
-    )
-
-# --- Numerics (cast + median impute to avoid assembler nulls) ---
-numeric_inputs = [c for c in [
-    "MIN_YEARS_EXPERIENCE",
-    "MAX_YEARS_EXPERIENCE",
-    "DURATION",
-    "IS_INTERNSHIP",
-    "COMPANY_IS_STAFFING",
-] if c in regression_df.columns]
-
-for c in numeric_inputs:
-    regression_df = regression_df.withColumn(c, col(c).cast("double"))
-    med = regression_df.where(col(c).isNotNull()).approxQuantile(c, [0.5], 0.01)
-    med = float(med[0]) if med else 0.0
-    regression_df = regression_df.withColumn(c, F.coalesce(col(c), F.lit(med)))
-
-# --- Categoricals (use only what exists) ---
-categorical_cols = [c for c in [
-    "STATE_NAME",
-    "MIN_EDULEVELS_NAME",
-    "EMPLOYMENT_TYPE_NAME",
-    "REMOTE_TYPE_NAME",
-    "EDUCATION_LEVELS_NAME",
-] if c in regression_df.columns]
-
-indexers = [StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep") for c in categorical_cols]
-encoders = OneHotEncoder(
-    inputCols=[f"{c}_idx" for c in categorical_cols],
-    outputCols=[f"{c}_vec" for c in categorical_cols],
-    handleInvalid="keep",
-    dropLast=True,
+glr = GeneralizedLinearRegression(
+    featuresCol="features",
+    labelCol="SALARY",
+    family="gaussian",   
+    link="identity",     
+    maxIter=10,
+    regParam=0.3
 )
+glr_model = glr.fit(train_df)   # requires train_df from the split chunk
+summary = glr_model.summary
 
-assembler = VectorAssembler(
-    inputCols=numeric_inputs + [f"{c}_vec" for c in categorical_cols],
-    outputCol="features"
-)
-
-pipeline = Pipeline(stages=indexers + [encoders, assembler])
-regression_data = pipeline.fit(regression_df).transform(regression_df)
-
-# Diagnostics: prove there are no null labels here either
-regression_data.select(
-    F.count("*").alias("rows"),
-    F.sum(col("SALARY").isNull().cast("int")).alias("salary_nulls")
-).show()
-
-print("Numeric inputs:", numeric_inputs)
-print("Categoricals:", categorical_cols)
-regression_data.select("SALARY", "features").show(5, truncate=False)
+print("Fitted GLR. Intercept:", glr_model.intercept, "| Num features:", glr_model.numFeatures)
 
 ```
-YOU ARE HERE @ 20:19
+
+# FN-helpers
+```{python}
+#| echo: true
+import numpy as np, pandas as pd
+
+def build_feature_names(vec_model, base_inputs, categorical_cols):
+    """
+    Expand *_vec columns into readable one-hot names using the indexer labels
+    and OHE category sizes. Falls back to generic names if labels unavailable.
+    """
+    indexer_labels = {}
+    for st in getattr(vec_model, "stages", []):
+        if hasattr(st, "labels") and hasattr(st, "getOutputCol"):
+            out_col = st.getOutputCol()
+            if out_col.endswith("_idx"):
+                indexer_labels[out_col[:-4]] = list(st.labels)
+
+    ohe_sizes = {}
+    for st in getattr(vec_model, "stages", []):
+        if hasattr(st, "categorySizes") and hasattr(st, "getOutputCols"):
+            for out, size in zip(st.getOutputCols(), st.categorySizes):
+                ohe_sizes[out] = int(size)
+
+    names = []
+    for col in base_inputs:
+        if col.endswith("_vec"):
+            base = col[:-4]
+            size = ohe_sizes.get(col, len(indexer_labels.get(base, [])))
+            onehot_len = max((size or 1) - 1, 0)   # dropLast=True
+            labels = indexer_labels.get(base, [])
+            if labels and len(labels) >= onehot_len:
+                names.extend([f"{base}={lab}" for lab in labels[:onehot_len]])
+            else:
+                names.extend([f"{base}__{i}" for i in range(onehot_len)])
+        else:
+            names.append(col)
+    return names
+
+```
+
+# Create GLR Table
+```{python}
+#| echo: true
+# Resolve feature names from your feature-engineering pipeline
+if 'assembler_inputs' in globals():
+    base_inputs = assembler_inputs
+elif 'assembler' in globals():
+    base_inputs = assembler.getInputCols()
+else:
+    base_inputs = []
+
+if 'vec_model' in globals() and base_inputs and 'categorical_cols' in globals():
+    feature_names = build_feature_names(vec_model, base_inputs, categorical_cols)
+else:
+    feature_names = [f"f{i}" for i in range(glr_model.numFeatures)]
+
+# Pull coefficient stats from GLR summary
+coefs = np.array(glr_model.coefficients) if hasattr(glr_model.coefficients, "__array__") \
+        else np.array(glr_model.coefficients.toArray())
+se    = np.array(summary.coefficientStandardErrors)
+tvals = np.array(summary.tValues)
+pvals = np.array(summary.pValues)
+
+n = min(len(feature_names), len(coefs), len(se), len(tvals), len(pvals))
+rows = []
+for i in range(n):
+    ci_low  = coefs[i] - 1.96*se[i]
+    ci_high = coefs[i] + 1.96*se[i]
+    rows.append([feature_names[i], coefs[i], se[i], tvals[i], pvals[i], ci_low, ci_high])
+
+coef_df = pd.DataFrame(
+    rows,
+    columns=["feature","coef","std_err","t_value","p_value","ci_low_95","ci_high_95"]
+)
+
+print("Intercept:", glr_model.intercept)
+print("\n=== Coefficient table (first 40) ===")
+print(coef_df.head(40).to_string(index=False))
+
+
+```
+
+# Train/Test Metrics
+```{python}
+#| echo: true
+from pyspark.ml.evaluation import RegressionEvaluator
+
+print("\n=== TRAIN metrics (GLR) ===")
+print("AIC:", summary.aic)
+print("Deviance:", summary.deviance, "| Null Deviance:", summary.nullDeviance)
+print("Dispersion:", summary.dispersion)
+print("DoF Residual:", summary.residualDegreeOfFreedom, "| DoF Null:", summary.residualDegreeOfFreedomNull)
+print("Iterations:", summary.numIterations)
+
+pred_test = glr_model.transform(test_df)  # requires test_df from split chunk
+ev = lambda m: RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName=m)
+
+print("\n=== TEST metrics ===")
+print("RMSE (test):", ev("rmse").evaluate(pred_test))
+print("MAE  (test):", ev("mae").evaluate(pred_test))
+print("R^2  (test):", ev("r2").evaluate(pred_test))
+
+```
+# GLR Summary
+```{python}
+# === GLR summary bundle ===
+import numpy as np, pandas as pd
+from pyspark.ml.evaluation import RegressionEvaluator
+
+# If you already defined build_feature_names earlier, this will use it;
+# otherwise we fall back to assembler inputs (won't expand one-hot labels, but fine).
+def _resolve_feature_names():
+    try:
+        return build_feature_names(vec_model, assembler_inputs, categorical_cols)
+    except Exception:
+        base_inputs = assembler_inputs if 'assembler_inputs' in globals() else assembler.getInputCols()
+        return list(base_inputs)
+
+feature_names = _resolve_feature_names()
+
+# Pull coefficient stats
+coefs = np.array(glr_model.coefficients.toArray())
+se    = np.array(summary.coefficientStandardErrors)
+tvals = np.array(summary.tValues)
+pvals = np.array(summary.pValues)
+
+n = min(len(feature_names), len(coefs), len(se), len(tvals), len(pvals))
+coef_df = pd.DataFrame({
+    "feature": feature_names[:n],
+    "coef":    coefs[:n],
+    "std_err": se[:n],
+    "t":       tvals[:n],
+    "p":       pvals[:n]
+})
+coef_df["abs_t"] = coef_df["t"].abs()
+
+print("Top 12 by |t| (most statistically significant):")
+print(coef_df.sort_values("abs_t", ascending=False).head(12).to_string(index=False))
+
+print("\nLargest positive effects (by coefficient):")
+print(coef_df.sort_values("coef", ascending=False).head(8).to_string(index=False))
+print("\nLargest negative effects (by coefficient):")
+print(coef_df.sort_values("coef", ascending=True).head(8).to_string(index=False))
+
+# Fit metrics
+ev = lambda m, df: RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName=m).evaluate(glr_model.transform(df))
+metrics = {
+    "AIC": summary.aic,
+    "Deviance": summary.deviance,
+    "Null Deviance": summary.nullDeviance,
+    "Dispersion": summary.dispersion,
+    "Train RMSE": ev("rmse", train_df),
+    "Train MAE":  ev("mae",  train_df),
+    "Train R2":   ev("r2",   train_df),
+    "Test RMSE":  ev("rmse", test_df),
+    "Test MAE":   ev("mae",  test_df),
+    "Test R2":    ev("r2",   test_df),
+    "Intercept":  glr_model.intercept,
+    "n_features": glr_model.numFeatures,
+    "n_train":    train_df.count(),
+    "n_test":     test_df.count(),
+}
+print("\n=== Fit summary ===")
+for k, v in metrics.items():
+    print(f"{k}: {v}")
+
+print("\nFeature set used:")
+print("  Continuous:", continuous_cols if 'continuous_cols' in globals() else "<unknown>")
+print("  Categorical:", categorical_cols if 'categorical_cols' in globals() else "<unknown>")
+print("  Assembler order:", assembler_inputs if 'assembler_inputs' in globals() else "<unknown>")
+
+```
+***Linear Regression Model Explanation*** Using a GLR with gaussian/identity, the model explains roughly a third of salary variation (R² ≈ 0.36 test; RMSE ≈ $35k, MAE ≈ $26–27k), so it captures some signal but leaves substantial noise. The coefficient signs and magnitudes align with intuition: the MIN_YEARS_EXPERIENCE term is positive and statistically reliable with a large t-value and a very small p-value, implying salaries increase by about $7.5k per additional required year. DURATION_LOG1P is negative and significant, suggesting postings that stay open longer tend to offer lower salaries, even after controlling for other factors. MAX_YEARS_EXPERIENCE is positive but weaker. In contrast, most state and minimum education one-hot coefficients show large standard errors, small t-values, and high p-values; despite some large raw coefficients, these effects are not statistically distinguishable from zero in this sample. This pattern is consistent with high-cardinality dummies (many rare categories), sparse cells, and omitted drivers (role/seniority, company size, cost of living). Overall, the model finds clear, significant effects for experience and posting duration, while geography and education signals remain noisy. Further analysis on the effects of location and education levels would require more granular features to understand the entire picture.
+
+# Polynomial Regression Prep
+```{python}
+#| echo: true
+from pyspark.sql.functions import col, pow
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.regression import GeneralizedLinearRegression
+
+# Safety: make sure train/test have features_poly; if not, create it from MIN_YEARS_EXPERIENCE
+MINEXP_COL = "MIN_YEARS_EXPERIENCE"
+if "features_poly" not in train_df.columns:
+    train_tmp = train_df.withColumn(f"{MINEXP_COL}_SQ", pow(col(MINEXP_COL), 2.0))
+    poly_asm  = VectorAssembler(inputCols=[MINEXP_COL, f"{MINEXP_COL}_SQ"], outputCol="features_poly")
+    train_df  = poly_asm.transform(train_tmp)
+
+if "features_poly" not in test_df.columns:
+    test_tmp  = test_df.withColumn(f"{MINEXP_COL}_SQ", pow(col(MINEXP_COL), 2.0))
+    poly_asm2 = VectorAssembler(inputCols=[MINEXP_COL, f"{MINEXP_COL}_SQ"], outputCol="features_poly")
+    test_df   = poly_asm2.transform(test_tmp)
+
+# Train GLR using the polynomial feature vector (rename to 'features' for the estimator)
+train_poly = train_df.select("SALARY", col("features_poly").alias("features"))
+test_poly  = test_df.select("SALARY", col("features_poly").alias("features"))
+
+glr_poly = GeneralizedLinearRegression(
+    featuresCol="features",
+    labelCol="SALARY",
+    family="gaussian",
+    link="identity",
+    maxIter=50,
+    regParam=0.0  # keep unregularized to mirror OLS
+)
+glr_poly_model = glr_poly.fit(train_poly)
+poly_summary   = glr_poly_model.summary
+
+print("Poly model fitted.")
+print("Intercept:", glr_poly_model.intercept, "| Num features:", glr_poly_model.numFeatures)
+
+
+```
+
+# Polynomial Coefficient Table
+```{python}
+#| echo: true
+import numpy as np, pandas as pd
+
+# Feature names for the two polynomial terms (order matches the assembler we used)
+poly_inputs = [MINEXP_COL, f"{MINEXP_COL}_SQ"]
+
+coefs = np.array(glr_poly_model.coefficients.toArray())
+se    = np.array(poly_summary.coefficientStandardErrors)
+tvals = np.array(poly_summary.tValues)
+pvals = np.array(poly_summary.pValues)
+
+n = min(len(poly_inputs), len(coefs), len(se), len(tvals), len(pvals))
+rows = []
+for i in range(n):
+    ci_low  = coefs[i] - 1.96 * se[i]
+    ci_high = coefs[i] + 1.96 * se[i]
+    rows.append([poly_inputs[i], coefs[i], se[i], tvals[i], pvals[i], ci_low, ci_high])
+
+coef_poly_df = pd.DataFrame(rows, columns=["feature","coef","std_err","t_value","p_value","ci_low_95","ci_high_95"])
+print("\n=== Polynomial coefficients ===")
+print(coef_poly_df.to_string(index=False))
+
+
+```
+
+# Polynomial Metrics
+```{python}
+#| echo: true
+from pyspark.ml.evaluation import RegressionEvaluator
+
+# Train metrics (GLR gives AIC/deviance; R²/RMSE/MAE via evaluator)
+print("\n=== TRAIN metrics (polynomial) ===")
+print("AIC:", poly_summary.aic)
+print("Deviance:", poly_summary.deviance, "| Null Deviance:", poly_summary.nullDeviance)
+print("Dispersion:", poly_summary.dispersion)
+
+pred_train_poly = glr_poly_model.transform(train_poly)
+pred_test_poly  = glr_poly_model.transform(test_poly)
+
+ev = lambda m, df: RegressionEvaluator(labelCol="SALARY", predictionCol="prediction", metricName=m).evaluate(df)
+print("RMSE (train):", ev("rmse", pred_train_poly))
+print("MAE  (train):", ev("mae",  pred_train_poly))
+print("R^2  (train):", ev("r2",   pred_train_poly))
+
+print("\n=== TEST metrics (polynomial) ===")
+print("RMSE (test):", ev("rmse", pred_test_poly))
+print("MAE  (test):", ev("mae",  pred_test_poly))
+print("R^2  (test):", ev("r2",   pred_test_poly))
+
+# Tiny interpretive aid (don’t assume sign—read from your printed table):
+beta1 = float(coefs[0]) if len(coefs)>0 else float('nan')   # MIN_YEARS_EXPERIENCE
+beta2 = float(coefs[1]) if len(coefs)>1 else float('nan')   # MIN_YEARS_EXPERIENCE_SQ
+
+shape = "concave (diminishing returns)" if beta2 < 0 else ("convex (accelerating returns)" if beta2 > 0 else "approximately linear")
+print(f"\nShape hint: with β2 = {beta2:.4g}, the salary–experience curve is {shape}.")
+
+
+```
+***Polynomial Regression Model Explanation*** The polynomial GLR (gaussian/identity) was fit on features_poly = [MIN_YEARS_EXPERIENCE, MIN_YEARS_EXPERIENCE^2]. Out-of-sample performance is modest: RMSE ≈ 37.6k, MAE ≈ 28.7k, and R² ≈ 0.275 on the test set (train: RMSE ≈ 36.9k, MAE ≈ 28.3k, R² ≈ 0.278). The model fit metrics are consistent with the linear model and slightly worse (AIC 452,747 vs ~450,302 for the linear run), indicating the quadratic term does not add predictive signal given the current features. Coefficient estimates from the GLR summary show a positive linear effect of experience and a negative quadratic term since β₂ < 0 and this model returned -460, implying a concave salary–experience curve where salary rises with experience, with the marginal gain per extra year diminishing at higher experience levels. Standard errors, t-values, and p-values from the summary quantify reliability of these effects as the linear term is typically significant, while the quadratic term’s significance should be read directly from the printed table. Overall, most variance in salary remains unexplained by experience alone and the two categorical controls used previously, which is consistent with compensation being driven by many factors (role/level, company, skills, location specifics, benefits, etc.). If this were being investigated further, reasonable next steps would be to center experience before squaring to reduce multicollinearity and stabilize inference and to incorporate richer features (job title/seniority, industry, skills) to understand the entire picture.
+
+# Random Forest Regressor
+```{python}
+# === Random Forest Regressor (features) ===
+# Uses: train_df, test_df with columns ["features", "SALARY"]
+
+from pyspark.ml.regression import RandomForestRegressor
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.sql.functions import col
+import numpy as np, pandas as pd
+
+# Safety checks
+for c in ["features", "SALARY"]:
+    assert c in train_df.columns, f"Missing column '{c}' in train_df"
+    assert c in test_df.columns,  f"Missing column '{c}' in test_df"
+
+# Hyperparameters (pick within the asked ranges)
+rf = RandomForestRegressor(
+    featuresCol="features",
+    labelCol="SALARY",
+    numTrees=200,         # 100–500
+    maxDepth=8,           # 4–10
+    featureSubsetStrategy="auto",
+    seed=42
+)
+
+rf_model = rf.fit(train_df)
+
+# Predictions
+pred_train = rf_model.transform(train_df)
+pred_test  = rf_model.transform(test_df)
+
+# Metrics helpers
+ev = lambda m, df: RegressionEvaluator(
+    labelCol="SALARY", predictionCol="prediction", metricName=m
+).evaluate(df)
+
+print("=== Random Forest — Train/Test metrics ===")
+print(f"Num trees: {rf.getNumTrees} | Max depth: {rf.getMaxDepth()}")
+
+print("\n-- TRAIN --")
+print("RMSE:", ev("rmse", pred_train))
+print("MAE :", ev("mae",  pred_train))
+print("R^2 :", ev("r2",   pred_train))
+
+print("\n-- TEST --")
+print("RMSE:", ev("rmse", pred_test))
+print("MAE :", ev("mae",  pred_test))
+print("R^2 :", ev("r2",   pred_test))
+
+# ---------- Top feature importances (robust naming) ----------
+def names_from_vector_metadata(df, colname="features"):
+    """Try to read attribute names from Spark vector metadata."""
+    try:
+        ml_attr = df.schema[colname].metadata.get("ml_attr", {})
+        attrs = ml_attr.get("attrs", {})
+        pairs = []
+        for k in ("binary", "numeric", "nominal"):
+            for a in attrs.get(k, []):
+                pairs.append((a["idx"], a["name"]))
+        pairs.sort(key=lambda x: x[0])
+        return [name for _, name in pairs]
+    except Exception:
+        return None
+
+# 1) Best source: vector metadata on training frame
+feat_names = names_from_vector_metadata(train_df, "features")
+
+# 2) Fallback: if you have a pipeline + helper from the GLR section
+if (not feat_names) and 'vec_model' in globals():
+    if 'assembler_inputs' in globals():
+        base_inputs = assembler_inputs
+    elif 'assembler' in globals():
+        base_inputs = assembler.getInputCols()
+    else:
+        base_inputs = []
+    if base_inputs and 'categorical_cols' in globals() and 'build_feature_names' in globals():
+        feat_names = build_feature_names(vec_model, base_inputs, categorical_cols)
+
+# 3) Final fallback: generic names; force length to match model
+num_feats = rf_model.numFeatures
+if not feat_names or len(feat_names) != num_feats:
+    feat_names = (feat_names or [])
+    if len(feat_names) < num_feats:
+        feat_names += [f"f{i}" for i in range(len(feat_names), num_feats)]
+    else:
+        feat_names = feat_names[:num_feats]
+
+# Assemble importance table
+imps = np.array(rf_model.featureImportances.toArray())
+k = min(20, len(imps))
+top_idx = np.argsort(-imps)[:k]
+
+imp_df = (
+    pd.DataFrame({"feature": [feat_names[i] for i in top_idx],
+                  "importance": imps[top_idx]})
+    .sort_values("importance", ascending=False)
+)
+
+print("\n=== Top feature importances (RF) ===")
+print(imp_df.to_string(index=False))
+
+
+```
+
+# Feature Importance Plot
+```{python}
+# === 6.1 Feature Importance Plot (Seaborn) ===
+# Requires: rf_model, train_df (for feature metadata), and optionally:
+#           feat_names or build_feature_names()/assembler_inputs/vec_model
+
+import numpy as np, pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# -- recover feature names if needed --
+def names_from_vector_metadata(df, colname="features"):
+    try:
+        ml_attr = df.schema[colname].metadata.get("ml_attr", {})
+        attrs = ml_attr.get("attrs", {})
+        pairs = []
+        for k in ("binary", "numeric", "nominal"):
+            for a in attrs.get(k, []):
+                pairs.append((a["idx"], a["name"]))
+        pairs.sort(key=lambda x: x[0])
+        return [name for _, name in pairs]
+    except Exception:
+        return None
+
+if 'feat_names' not in globals() or not feat_names:
+    feat_names = names_from_vector_metadata(train_df, "features")
+    if (not feat_names) and 'vec_model' in globals():
+        if 'assembler_inputs' in globals():
+            base_inputs = assembler_inputs
+        elif 'assembler' in globals():
+            base_inputs = assembler.getInputCols()
+        else:
+            base_inputs = []
+        if base_inputs and 'categorical_cols' in globals() and 'build_feature_names' in globals():
+            feat_names = build_feature_names(vec_model, base_inputs, categorical_cols)
+
+# final fallback to generic names
+num_feats = rf_model.numFeatures
+if not feat_names or len(feat_names) != num_feats:
+    feat_names = (feat_names or [])
+    if len(feat_names) < num_feats:
+        feat_names += [f"f{i}" for i in range(len(feat_names), num_feats)]
+    else:
+        feat_names = feat_names[:num_feats]
+
+# -- assemble importance DataFrame if needed --
+if 'imp_df' not in globals():
+    imps = np.array(rf_model.featureImportances.toArray())
+    imp_df = pd.DataFrame({"feature": feat_names, "importance": imps})
+
+# Top 10 (descending)
+top10 = imp_df.sort_values("importance", ascending=False).head(10)
+top10 = top10.iloc[::-1]  # reverse for horizontal plot (largest at top)
+
+# Plot
+plt.figure(figsize=(8, 5))
+sns.barplot(data=top10, x="importance", y="feature")
+plt.xlabel("Importance")
+plt.ylabel("Feature")
+plt.title("Random Forest — Top 10 Feature Importances")
+plt.tight_layout()
+
+# Save
+out_dir = Path("output"); out_dir.mkdir(exist_ok=True, parents=True)
+out_path = out_dir / "rf_feature_importance.png"
+plt.savefig(out_path, dpi=200, bbox_inches="tight")
+plt.show()
+
+print(f"Saved feature importance plot to: {out_path}")
+
+
+```
+
+# GLR, Polynomial, and Random Forest Comparison Prep
+```{python}
+
+from pyspark.sql.functions import col
+
+assert 'data_exact' in globals(), "Run your feature-engineering chunk that creates `data_exact`."
+for c in ("features", "features_poly", "SALARY"):
+    assert c in data_exact.columns, f"`data_exact` is missing {c}. Re-run feature assembly."
+
+if 'train_df' not in globals() or 'test_df' not in globals():
+    print("No split found — creating an 80/20 split now (seed=42).")
+    train_df, test_df = data_exact.randomSplit([0.8, 0.2], seed=42)
+    train_df.cache(); test_df.cache()
+
+```
+
+# Train Polynomial GLR
+```{python}
+from pyspark.ml.regression import GeneralizedLinearRegression
+
+train_poly_df = train_df.select("SALARY", "features_poly")
+test_poly_df  = test_df.select("SALARY", "features_poly")
+
+poly_glr = GeneralizedLinearRegression(
+    featuresCol="features_poly",
+    labelCol="SALARY",
+    family="gaussian",
+    link="identity",
+    maxIter=10,
+    regParam=0.3
+)
+poly_model   = poly_glr.fit(train_poly_df)
+poly_summary = poly_model.summary
+
+print("Polynomial GLR ready. #params:", poly_model.numFeatures + 1, "(including intercept)")
+
+
+```
+
+
+# Compare GLR vs Polynomial vs RF
+```{python}
+import math
+import numpy as np
+import pandas as pd
+from pyspark.sql.functions import col
+from pyspark.ml.evaluation import RegressionEvaluator
+
+for v in ["glr_model", "poly_model", "rf_model", "test_df"]:
+    if v not in globals():
+        raise ValueError(f"Missing {v}. Train models first.")
+
+# Predictions
+pred_glr  = glr_model.transform(test_df).select("SALARY", col("prediction").alias("pred_glr"))
+pred_poly = poly_model.transform(test_df).select("SALARY", col("prediction").alias("pred_poly"))
+pred_rf   = rf_model.transform(test_df).select("SALARY", col("prediction").alias("pred_rf"))
+
+wide = (pred_glr
+        .join(pred_poly, on=["SALARY"], how="inner")
+        .join(pred_rf,   on=["SALARY"], how="inner"))
+
+# Metrics helpers
+def pair_metrics(df, pred_col):
+    return {
+        "rmse": RegressionEvaluator(labelCol="SALARY", predictionCol=pred_col, metricName="rmse").evaluate(df),
+        "mae" : RegressionEvaluator(labelCol="SALARY", predictionCol=pred_col, metricName="mae").evaluate(df),
+    }
+
+m_glr  = pair_metrics(pred_glr.withColumnRenamed("pred_glr",  "prediction"), "prediction")
+m_poly = pair_metrics(pred_poly.withColumnRenamed("pred_poly","prediction"), "prediction")
+m_rf   = pair_metrics(pred_rf.withColumnRenamed("pred_rf",    "prediction"), "prediction")
+
+# AIC/BIC for GLR models only
+def loglik_from_summary(summary, n):
+    return -0.5 * ( n*math.log(2*math.pi) + n*math.log(summary.dispersion) + summary.deviance/summary.dispersion )
+
+if 'summary' not in globals():
+    summary = glr_model.summary
+n_train = summary.numInstances
+k_glr   = glr_model.numFeatures + 1
+ll_glr  = loglik_from_summary(summary, n_train)
+bic_glr = k_glr*math.log(n_train) - 2*ll_glr
+aic_glr = summary.aic
+
+n_train_poly = poly_summary.numInstances
+k_poly       = poly_model.numFeatures + 1
+ll_poly      = loglik_from_summary(poly_summary, n_train_poly)
+bic_poly     = k_poly*math.log(n_train_poly) - 2*ll_poly
+aic_poly     = poly_summary.aic
+
+compare_df = pd.DataFrame([
+    ["GLR (linear)",       m_glr["rmse"],  m_glr["mae"],  aic_glr,  bic_glr],
+    ["Polynomial (GLR^2)", m_poly["rmse"], m_poly["mae"], aic_poly, bic_poly],
+    ["Random Forest",      m_rf["rmse"],   m_rf["mae"],   None,     None],
+], columns=["model","rmse","mae","aic (train)","bic (train)"])
+
+print(compare_df.to_string(index=False))
+
+
+```
+
+# GLR, Polynomial, and Random Forest Comparison Plot
+```{python}
+# --- 2×2 grid with ONLY the three model scatter plots (GLR, Poly, RF) ---
+import os, seaborn as sns, matplotlib.pyplot as plt
+
+os.makedirs("_output", exist_ok=True)
+
+pdf = wide.toPandas()
+if len(pdf) == 0:
+    raise ValueError("No rows in prediction frame; ensure glr_model/poly_model/rf_model were trained and predictions joined.")
+
+# safe downsample for readability
+n_sample = min(5000, len(pdf))
+plot_df = pdf.sample(n=n_sample, random_state=42) if len(pdf) > n_sample else pdf
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+ax = axes.ravel()
+
+plots = [
+    ("GLR: Actual vs Predicted",              "pred_glr"),
+    ("Polynomial (GLR^2): Actual vs Pred.",   "pred_poly"),
+    ("Random Forest: Actual vs Predicted",    "pred_rf"),
+]
+
+for i, (title, ycol) in enumerate(plots):
+    sns.scatterplot(data=plot_df, x="SALARY", y=ycol, s=12, ax=ax[i])
+    ax[i].set_title(title)
+    ax[i].set_xlabel("Actual SALARY")
+    ax[i].set_ylabel("Predicted")
+
+# leave the 4th quadrant empty to keep a 2×2 layout
+ax[3].axis("off")
+
+plt.tight_layout()
+out_path = "output/compare_actual_vs_pred_2x2.png"
+plt.savefig(out_path, dpi=160, bbox_inches="tight")
+plt.show()
+print("Saved:", out_path)
+
+
+```
